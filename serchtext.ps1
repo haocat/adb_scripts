@@ -1,37 +1,28 @@
 <#
-应急消防巡查自动化脚本 - 模糊匹配实时UI版
-更新内容：
-1. 支持模糊匹配：只要元素文字包含关键词即可匹配
-2. 自动转义特殊字符，避免XPath语法错误
-3. 保留所有原有功能：实时UI抓取、智能等待、自动重试
-4. 优化匹配算法，优先匹配最相似的结果
+应急消防巡查自动化脚本 - 模糊匹配+批量点击版
+更新：新增批量点击同页面所有匹配元素
 #>
 
 # 配置参数
 $ADB_PATH = "./adb.exe"
 $TEMP_XML = "./ui_latest.xml"
-$MAX_WAIT_SECONDS = 10  # 等待元素出现的最大时间
-$MAX_RETRIES = 3        # 操作失败重试次数
+$MAX_WAIT_SECONDS = 10
+$MAX_RETRIES = 3
 $DEBUG = $false
 
 # ======================================
-# 核心函数（模糊匹配+实时UI）
+# 核心函数
 # ======================================
-
 function Get-LatestUI {
     param(
         [int]$Retries = 2
     )
-    
     for ($i = 0; $i -lt $Retries; $i++) {
-        # 导出最新UI结构
         & $ADB_PATH shell uiautomator dump --compressed /sdcard/$TEMP_XML 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) {
             Start-Sleep -Milliseconds 500
             continue
         }
-        
-        # 拉取到本地
         & $ADB_PATH pull /sdcard/$TEMP_XML 2>&1 | Out-Null
         if (Test-Path $TEMP_XML) {
             try {
@@ -43,48 +34,37 @@ function Get-LatestUI {
                 continue
             }
             finally {
-                # 立即清理临时文件
                 if (Test-Path $TEMP_XML) { Remove-Item $TEMP_XML -Force }
                 & $ADB_PATH shell rm /sdcard/$TEMP_XML 2>&1 | Out-Null
             }
         }
         Start-Sleep -Milliseconds 500
     }
-    
     Write-Host "[错误] 无法获取最新UI结构"
     return $null
 }
 
+# 查找单个匹配元素（原有逻辑）
 function Wait-ForElement {
     param(
         [Parameter(Mandatory=$true)]
-        [string]$Keyword,  # 现在是关键词，不是完整文字
+        [string]$Keyword,
         [int]$TimeoutSeconds = $MAX_WAIT_SECONDS
     )
-    
-    # 转义XPath特殊字符（单引号）
     $escapedKeyword = $Keyword.Replace("'", "''")
-    
     $endTime = (Get-Date).AddSeconds($TimeoutSeconds)
-    
     while ((Get-Date) -lt $endTime) {
         $xml = Get-LatestUI
         if ($xml) {
-            # 模糊匹配：只要text属性包含关键词即可
             $nodes = $xml.SelectNodes("//node[contains(@text, '$escapedKeyword')]")
-            
             if ($nodes.Count -gt 0) {
-                # 优先选择第一个匹配的元素
                 $node = $nodes[0]
-                
                 if ($node.bounds -match '\[(\d+),(\d+)\]\[(\d+),(\d+)\]') {
                     $x1 = [int]$matches[1]
                     $y1 = [int]$matches[2]
                     $x2 = [int]$matches[3]
                     $y2 = [int]$matches[4]
-                    
                     Write-Host "[匹配] 找到包含 '$Keyword' 的元素: '$($node.text)'"
-                    
                     return @{
                         X = ($x1 + $x2) / 2
                         Y = ($y1 + $y2) / 2
@@ -96,21 +76,19 @@ function Wait-ForElement {
         }
         Start-Sleep -Milliseconds 500
     }
-    
     return @{Found = $false}
 }
 
+# 单个元素点击（原有）
 function Click-ByText {
     param(
         [Parameter(Mandatory=$true)]
-        [string]$Keyword,  # 现在是关键词
+        [string]$Keyword,
         [int]$WaitTime = 1000,
         [int]$Retries = $MAX_RETRIES
     )
-    
     for ($i = 0; $i -lt $Retries; $i++) {
         Write-Host "[尝试 $($i+1)/$Retries] 查找包含: '$Keyword'"
-        
         $result = Wait-ForElement $Keyword
         if ($result.Found) {
             Write-Host "[成功] 点击: '$($result.Text)' 坐标: ($($result.X), $($result.Y))"
@@ -119,15 +97,63 @@ function Click-ByText {
             Start-Sleep -Milliseconds $WaitTime
             return $true
         }
-        
         Write-Host "[重试] 未找到包含 '$Keyword' 的元素"
         Start-Sleep -Milliseconds 1000
     }
-    
     Write-Host "[失败] 多次尝试后仍未找到包含 '$Keyword' 的元素"
     return $false
 }
 
+# 新增：批量点击当前页面所有匹配关键词的元素
+function Click-All-Matched {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Keyword,
+        [int]$WaitPerClick = 800,
+        [int]$TimeoutSeconds = $MAX_WAIT_SECONDS
+    )
+    $escapedKeyword = $Keyword.Replace("'", "''")
+    $endTime = (Get-Date).AddSeconds($TimeoutSeconds)
+    $hasClick = $false
+
+    while ((Get-Date) -lt $endTime) {
+        $xml = Get-LatestUI
+        if (-not $xml) {
+            Start-Sleep -Milliseconds 500
+            continue
+        }
+        $nodes = $xml.SelectNodes("//node[contains(@text, '$escapedKeyword')]")
+        if ($nodes.Count -eq 0) {
+            Start-Sleep -Milliseconds 500
+            continue
+        }
+
+        Write-Host "[批量匹配] 共找到 $($nodes.Count) 个包含 '$Keyword' 的元素，开始逐个点击"
+        foreach ($node in $nodes) {
+            if ($node.bounds -match '\[(\d+),(\d+)\]\[(\d+),(\d+)\]') {
+                $x1 = [int]$matches[1]
+                $y1 = [int]$matches[2]
+                $x2 = [int]$matches[3]
+                $y2 = [int]$matches[4]
+                $cx = ($x1 + $x2) / 2
+                $cy = ($y1 + $y2) / 2
+
+                Write-Host "[批量点击] '$($node.text)' 坐标: ($cx, $cy)"
+                & $ADB_PATH shell input tap $cx $cy
+                $hasClick = $true
+                Start-Sleep -Milliseconds $WaitPerClick
+            }
+        }
+        break
+    }
+
+    if (-not $hasClick) {
+        Write-Host "[批量点击] 超时未找到任何包含 '$Keyword' 的元素"
+    }
+    return $hasClick
+}
+
+# 坐标点击
 function Click-ByCoords {
     param(
         [Parameter(Mandatory=$true)]
@@ -136,13 +162,13 @@ function Click-ByCoords {
         [int]$Y,
         [int]$WaitTime = 1000
     )
-    
     Write-Host "[操作] 点击坐标: ($X, $Y)"
     & $ADB_PATH shell input tap $X $Y
     Write-Host "[等待] $WaitTime 毫秒"
     Start-Sleep -Milliseconds $WaitTime
 }
 
+# 滑动
 function Swipe {
     param(
         [Parameter(Mandatory=$true)]
@@ -156,7 +182,6 @@ function Swipe {
         [int]$Duration = 500,
         [int]$WaitTime = 1000
     )
-    
     Write-Host "[操作] 滑动: ($X1, $Y1) -> ($X2, $Y2) 持续 $Duration 毫秒"
     & $ADB_PATH shell input swipe $X1 $Y1 $X2 $Y2 $Duration
     Write-Host "[等待] $WaitTime 毫秒"
@@ -166,14 +191,11 @@ function Swipe {
 # ======================================
 # 初始化检查
 # ======================================
-
 Write-Host "=============================================="
-Write-Host "应急消防巡查自动化脚本 - 模糊匹配版"
-Write-Host "特点：支持关键词模糊匹配，自动适应文字变化"
+Write-Host "应急消防巡查自动化脚本 - 模糊匹配+批量点击版"
 Write-Host "=============================================="
 Write-Host ""
 
-# 检查ADB是否存在
 if (-not (Get-Command $ADB_PATH -ErrorAction SilentlyContinue)) {
     Write-Host "[错误] 找不到 $ADB_PATH"
     Write-Host "请将adb.exe、AdbWinApi.dll、AdbWinUsbApi.dll放在脚本同一目录"
@@ -182,15 +204,11 @@ if (-not (Get-Command $ADB_PATH -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
-# 检查设备连接
 $devices = & $ADB_PATH devices
 if (-not ($devices -match "device$")) {
     Write-Host "[错误] 未检测到已连接的Android设备"
     Write-Host ""
-    Write-Host "请检查："
-    Write-Host "1. 手机已通过USB连接电脑"
-    Write-Host "2. 手机已开启开发者选项和USB调试"
-    Write-Host "3. 已在手机上授权本电脑的调试请求"
+    Write-Host "请检查USB、开发者选项、USB调试授权"
     Write-Host ""
     Read-Host "按回车键退出"
     exit 1
@@ -204,18 +222,17 @@ Write-Host ""
 Start-Sleep -Seconds 3
 
 # ======================================
-# 执行操作序列（现在可以用关键词了！）
+# 执行流程
 # ======================================
-
 Write-Host "[开始] 执行自动化操作..."
 Write-Host ""
 
-# 导航步骤（使用关键词，更灵活）
+# 导航步骤
 Click-ByText "工作台" 2000
 Click-ByText "掌上基层" 3000
 Click-ByText "应急消防" 3000
-Click-ByText "专项巡查任务" 1000  
-Click-ByText "应急专项巡查" 1000  # 
+Click-ByText "专项巡查任务" 1000
+Click-ByText "应急专项巡查" 1000
 Click-ByText "九小场所专项巡查任务" 1000
 
 # 点击第一家企业
@@ -252,39 +269,31 @@ Click-ByText "确认" 12000
 
 Write-Host ""
 Write-Host "[成功] 完成出口通道不畅通问题填写"
-Write-Host "[开始] 填写其余问题为'否'"
+Write-Host "[开始] 批量填写当前页所有「否」"
 Write-Host ""
 
-# 批量填写"否"
+# 滑动 + 批量点击当前页面所有「否」，不再重复写多条 Click-ByText
 Swipe 355 1438 355 438 500 1000
-Click-ByText "否" 1000
-Click-ByText "否" 1000
-Click-ByText "否" 1000
+Click-All-Matched "否" 800
 
 Swipe 355 1838 355 238 500 1000
-Click-ByText "否" 1000
-Click-ByText "否" 1000
+Click-All-Matched "否" 800
 
 Swipe 355 1838 355 238 500 1000
-Click-ByText "否" 1000
-Click-ByText "否" 1000
+Click-All-Matched "否" 800
 
 Swipe 355 2163 355 238 500 1000
-Click-ByText "否" 1000
-Click-ByText "否" 1000
+Click-All-Matched "否" 800
 
 Swipe 355 2163 355 238 500 1000
-Click-ByText "否" 1000
-Click-ByText "否" 1000
+Click-All-Matched "否" 800
 
 # ======================================
-# 完成
+# 结束
 # ======================================
-
 Write-Host ""
 Write-Host "=============================================="
 Write-Host "[成功] 所有操作执行完成！"
-Write-Host "已完成12道题的填写"
 Write-Host "请手动检查并提交表单"
 Write-Host "=============================================="
 Write-Host ""
