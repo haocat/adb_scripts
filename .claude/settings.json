@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(powershell -Command \"[System.IO.File]::ReadAllBytes\\('e:\\\\adb_scripts_pro\\\\adb_scripts\\\\serchtext.ps1'\\)[0..2]\")",
+      "Bash(python -c ' *)",
+      "Bash(./adb.exe devices *)",
+      "Bash(./adb.exe shell *)",
+      "Bash(./adb.exe pull *)"
+    ]
+  }
+}

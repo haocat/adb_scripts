@@ -229,12 +229,12 @@ Write-Host "[开始] 执行自动化操作..."
 Write-Host ""
 
 # 导航步骤
-# Click-ByText "工作台" 2000
-# Click-ByText "掌上基层" 3000
-# Click-ByText "应急消防" 3000
-# Click-ByText "专项巡查任务" 1000
-# Click-ByText "应急专项巡查" 1000
-# Click-ByText "九小场所专项巡查任务" 1000
+Click-ByText "工作台" 2000
+Click-ByText "掌上基层" 3000
+Click-ByText "应急消防" 3000
+Click-ByText "专项巡查任务" 1000
+Click-ByText "应急专项巡查" 1000
+Click-ByText "九小场所专项巡查任务" 1000
 
 # 点击第一家企业
 Click-ByCoords 642 834 1000
