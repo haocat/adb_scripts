@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-应急消防巡查自动化脚本 - 智能版
-===================================
-改进:
-  1. 动态获取屏幕尺寸，用相对坐标替代硬编码像素
-  2. 页面状态检测 — 每步操作后验证页面是否跳转
-  3. 智能元素查找 — 处理 WebView 嵌套 clickable 问题
-  4. 图片上传 UUID 验证 — 确认图片真的上传成功
-  5. 失败自动截图 — 便于排查问题
-  6. 可配置图片选择坐标 — 适配不同设备
-  7. 导航自动跳过已完成步骤
-  8. 增强的 WebView 元素查找（处理 text 在子节点、clickable 在父节点的情况）
+应急消防巡查自动化脚本
+========================
+功能：自动填写「九小场所专项巡查」表单。
+      支持多问题（1/6/9）选「是」→ 自行处置 → 上传图片 → 分类 → 提交。
+      其余问题自动填「否」，最后可自动提交表单。
+
+用法：
+  python autofill_problem1.py          # 默认只报告问题1
+  python autofill_problem1.py 6        # 只报告问题6
+  python autofill_problem1.py 1,6,9    # 报告问题1、6、9
+
+换设备注意事项：见文件顶部「换设备移植配置」区域。
 """
 
 import subprocess
@@ -19,45 +20,81 @@ import time
 import re
 import sys
 import os
+import random
 import xml.etree.ElementTree as ET
 from datetime import datetime
 
 
-# ======================================
-# 配置参数
-# ======================================
-ADB_PATH = "./adb.exe"
-TEMP_XML = "./ui_latest.xml"
-SCREENSHOT_DIR = "./screenshots"
-MAX_WAIT_SECONDS = 10
-MAX_RETRIES = 3
-DEBUG = True
+# ============================================================
+# 换设备移植配置 — 换设备后优先调整这里！
+# ============================================================
+# 原理：脚本用 find_clickable_by_text() 做大部分元素定位（自适应），
+#       但以下场景 UIAutomator 无法识别元素内容，不得不依赖相对坐标：
+#         a) 图库中选图片 — 图片网格不暴露给 UIAutomator
+#         b) 时间选择器滚轮 — 滚轮值不暴露精确位置
+#         c) 表单滑动 — WebView 中滑动距离和位置关系
+#       换设备后这些比例值可能需要微调。
+# ============================================================
 
-# ======================================
-# 图片选择器坐标配置（相对屏幕比例）
-# 因为 UIAutomator 无法识别图片网格中的单个图片，
-# 所以用相对坐标定位「最近照片」横条中的图片位置。
-# 注意：这是图库中选图的坐标，不是表单上上传按钮的坐标。
-# 上传按钮的点击已改用文本匹配（「附件最大不超过10M」）。
-# 如果你的设备选图不准，调整下面两个比例值。
-# ======================================
-# 第一张图（整改前）在「最近照片」横条中的相对位置
-IMAGE_1_RX = 0.71   # x / screen_w  (900/1264 ≈ 0.71)
-IMAGE_1_RY = 0.136  # y / screen_h  (379/2780 ≈ 0.136)
-# 第二张图（整改后）在「最近照片」横条中的相对位置
-IMAGE_2_RX = 0.46   # x / screen_w  (582/1264 ≈ 0.46)
-IMAGE_2_RY = 0.142  # y / screen_h  (394/2780 ≈ 0.142)
+ADB_PATH = "./adb.exe"                 # adb 路径（Windows 用 .exe）
+TEMP_XML = "./ui_latest.xml"           # 临时 UI dump 文件名
+SCREENSHOT_DIR = "./screenshots"       # 截图保存目录
+MAX_WAIT_SECONDS = 10                  # 等待元素出现的最大秒数
+MAX_RETRIES = 3                        # 点击操作最大重试次数
+DEBUG = True                           # 是否打印 ADB 命令
 
-# ======================================
-# 导航关键词配置
-# 实测发现「工作台」不存在，「掌上基层」是首页标题不可点击，
-# 真正的入口是「应急消防应用(新)」（contains 匹配用"应急消防"即可）。
-# SKIP_NAVIGATION=True 时跳过所有导航步骤（设备已在企业列表页时使用）
-# ======================================
+# --- 图库选图坐标（相对屏幕比例）---
+# UIAutomator 看不到图库中的单张图片，只能盲点「最近照片」横条。
+# 基准设备 1264×2780，换设备后如果点不到图，调整比例。
+IMAGE_1_RX = 0.71    # 整改前图片的 x 比例 (900/1264)
+IMAGE_1_RY = 0.136   # 整改前图片的 y 比例 (379/2780)
+IMAGE_2_RX = 0.46    # 整改后图片的 x 比例 (582/1264)
+IMAGE_2_RY = 0.142   # 整改后图片的 y 比例 (394/2780)
+
+# --- 时间选择器滚轮 ---
+# 分钟列位于屏幕右侧 x≈0.77，滑动起点 y≈0.885。
+# 基准: dy_rel=-0.777 对应约 20 分钟，每 ±0.039 ≈ ±1 分钟。
+# 换设备后如果时间不准，调整 BASE_DY_REL 和 PER_MINUTE_REL。
+TIME_PICKER_RX = 0.77          # 分钟列的 x 中心比例
+TIME_PICKER_RY_START = 0.885   # 滑动起点 y 比例
+TIME_PICKER_BASE_DY_REL = -0.777   # 20 分钟的基准滑动距离（屏高比）
+TIME_PICKER_PER_MINUTE_REL = 0.039 # 每分钟对应滑动距离（屏高比）
+
+# --- 表单内滑动参数 ---
+# WebView 中滑动巡查表单/隐患详情页时使用。
+# 水平位置 x=0.27 对应屏幕左 27%，避开了 AI 悬浮按钮。
+# 垂直范围 80%↔20% 保证滑动被识别，范围 63%↔5% 用于大幅翻页。
+SCROLL_X = 0.27             # 滑动操作的 x 位置
+SCROLL_DOWN_START = 0.80    # 向下翻页起点 y
+SCROLL_DOWN_END = 0.20      # 向下翻页终点 y
+SCROLL_BIG_START = 0.63     # 大幅翻页起点 y（隐患详情页用）
+SCROLL_BIG_END = 0.05       # 大幅翻页终点 y
+
+# --- 字段点击偏移 ---
+# 表单字段的「请选择」/下拉箭头通常在字段右侧。
+# 这个比例表示：字段 y 坐标不变，x = screen_w * 0.92 作为点击位置。
+FIELD_RIGHT_CLICK_RX = 0.92
+
+# ============================================================
+# 业务配置 — 通常不需要改
+# ============================================================
+
+# 是否最终提交表单（测试时 False，生产时 True）
+AUTO_SUBMIT = False
+
+# 是否跳过导航到企业列表（设备已在列表页时 True）
 SKIP_NAVIGATION = True
+
+# 所有支持的问题配置（num = 巡查项编号，keyword = 问题文本唯一关键词）
+ALL_PROBLEM_CONFIG = {
+    1:  {"keyword": "出口、通道",   "category": "消防安全", "subcategory": "出口、通道不畅通"},
+    6:  {"keyword": "电动自行车",   "category": "消防安全", "subcategory": "电动车室内停放、充电"},
+    9:  {"keyword": "灭火器",       "category": "消防安全", "subcategory": "消防设施检查"},
+}
+
+# 导航步骤（仅 SKIP_NAVIGATION=False 时使用）
+# 实测：「工作台」不存在，导航基本依赖 SKIP_NAVIGATION=True
 NAV_STEPS = [
-    # (keyword, wait_ms, description)
-    # 注意：第一个「工作台」实际不存在，保留为占位。如不需要请设 SKIP_NAVIGATION=True
     ("工作台", 2000, "首页工作台"),
     ("掌上基层", 3000, "掌上基层入口"),
     ("应急消防", 3000, "应急消防模块"),
@@ -67,11 +104,30 @@ NAV_STEPS = [
 ]
 
 
-# ======================================
-# 核心函数
-# ======================================
+def get_problems_to_report():
+    """根据命令行参数解析要报告的问题列表"""
+    if len(sys.argv) > 1:
+        nums = []
+        for part in sys.argv[1].split(","):
+            n = int(part.strip())
+            if n in ALL_PROBLEM_CONFIG:
+                nums.append(n)
+            else:
+                print(f"[警告] 问题 #{n} 无配置，已跳过")
+        if nums:
+            return [{"num": n, **ALL_PROBLEM_CONFIG[n]} for n in nums]
+    return [{"num": 1, **ALL_PROBLEM_CONFIG[1]}]
+
+
+PROBLEMS_TO_REPORT = get_problems_to_report()
+
+
+# ============================================================
+# 底层工具函数
+# ============================================================
+
 def run_adb(*args, check=True):
-    """运行 ADB 命令，返回 CompletedProcess"""
+    """运行 ADB 命令"""
     cmd = [ADB_PATH] + [str(a) for a in args]
     if DEBUG:
         short = ' '.join(cmd[:5])
@@ -82,7 +138,7 @@ def run_adb(*args, check=True):
 
 
 def screenshot(name=None):
-    """截屏保存到 SCREENSHOT_DIR"""
+    """截屏存到 SCREENSHOT_DIR"""
     os.makedirs(SCREENSHOT_DIR, exist_ok=True)
     if name is None:
         name = datetime.now().strftime("%H%M%S")
@@ -96,9 +152,13 @@ def screenshot(name=None):
 
 
 def get_latest_ui(retries=3):
-    """获取最新 UI XML，返回 (root, screen_w, screen_h) 或 (None, None, None)"""
+    """
+    dump + pull 设备 UI XML，返回 (root, screen_w, screen_h)。
+    屏幕尺寸从 root node 的 bounds 自动获取，适配不同设备。
+    """
     for _ in range(retries):
-        r = run_adb("shell", "uiautomator", "dump", "--compressed", f"/sdcard/{TEMP_XML}", check=False)
+        r = run_adb("shell", "uiautomator", "dump", "--compressed",
+                     f"/sdcard/{TEMP_XML}", check=False)
         if r.returncode != 0:
             time.sleep(0.5)
             continue
@@ -109,7 +169,7 @@ def get_latest_ui(retries=3):
                 with open(TEMP_XML, "r", encoding="utf-8") as f:
                     xml_str = f.read()
                 root = ET.fromstring(xml_str)
-                # 从 root node 的 bounds 获取屏幕尺寸
+                # 从 root bounds 自动获取屏幕尺寸（自适应不同分辨率）
                 root_bounds = root.attrib.get("bounds", "[0,0][1264,2780]")
                 m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', root_bounds)
                 if m:
@@ -140,7 +200,7 @@ def get_screen_size():
 
 
 def parse_bounds(bounds_str):
-    r"""解析 '\[x1,y1\][x2,y2]' → (cx, cy) 中心坐标"""
+    r"""解析 [x1,y1][x2,y2] → (cx, cy) 中心坐标"""
     m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', bounds_str)
     if m:
         x1, y1, x2, y2 = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
@@ -149,24 +209,28 @@ def parse_bounds(bounds_str):
 
 
 def _is_visible(bounds_str):
-    """检查元素是否在可视区域内（bounds 不为 [0,0][0,0]）"""
+    """WebView 中不可见元素的 bounds 为 [0,0][0,0]"""
     return bounds_str and bounds_str != "[0,0][0,0]"
 
 
 def _text_matches(node, keyword):
-    """检查节点的 text 属性是否包含 keyword（简单子串匹配）"""
+    """子串匹配"""
     return keyword in node.attrib.get("text", "")
 
 
 def _iter_all_nodes(root):
-    """遍历所有节点（含 root 自身）"""
+    """遍历 XML 树中的所有节点"""
     yield root
     for child in root:
         yield from _iter_all_nodes(child)
 
 
+# ============================================================
+# 元素查找函数（纯文本匹配，自适应不同设备）
+# ============================================================
+
 def find_nodes_by_text(root, keyword, visible_only=True):
-    """在 XML 树中查找包含指定文本的节点（遍历实现，避免 XPath 中文问题）"""
+    """遍历查找包含 keyword 的节点（替代 XPath，支持中文）"""
     results = []
     for node in _iter_all_nodes(root):
         if _text_matches(node, keyword):
@@ -177,22 +241,22 @@ def find_nodes_by_text(root, keyword, visible_only=True):
 
 def find_clickable_by_text(root, keyword, visible_only=True):
     """
-    查找包含指定文本的可点击元素。
-    WebView 中常见情况：文本在 TextView 上（clickable=false），
-    但其父节点 View 才是 clickable=true。此函数会向上查找。
-    返回 (clickable_node, text_content, cx, cy) 或 None
+    查找包含指定文本的「可点击」元素。
+    WebView 中文本通常在 TextView（不可点击）内，
+    而其父 View 才是 clickable=true，此函数会向上追溯到可点击父节点。
+    返回 (clickable_node, text, cx, cy) 或 None
     """
     matches = find_nodes_by_text(root, keyword, visible_only)
 
+    # 优先：自身可点击
     for node in matches:
         text = node.attrib.get("text", "")
-        # 检查自身是否可点击
         if node.attrib.get("clickable") == "true":
             center = parse_bounds(node.attrib.get("bounds", ""))
             if center:
                 return node, text, center[0], center[1]
 
-    # 自身不可点击，向上查找可点击的父节点
+    # 自身不可点击 → 向上找可点击的父节点
     for node in matches:
         text = node.attrib.get("text", "")
         parent = _find_clickable_ancestor(root, node)
@@ -209,10 +273,9 @@ def _find_clickable_ancestor(root, target_node):
     target_bounds = target_node.attrib.get("bounds", "")
 
     # 收集从 root 到 target 路径上的所有祖先
-    path = []
     def find_path(current_root, target_bounds_str, ancestors):
         if current_root.attrib.get("bounds") == target_bounds_str:
-            return list(ancestors)  # 返回祖先列表（不含自身）
+            return list(ancestors)
         for child in current_root:
             ancestors.append(current_root)
             result = find_path(child, target_bounds_str, ancestors)
@@ -225,7 +288,7 @@ def _find_clickable_ancestor(root, target_node):
     if not ancestors:
         return None
 
-    # 从最近的祖先开始找 clickable=true 的节点
+    # 从最近的祖先（列表末尾）开始找 clickable=true
     for ancestor in reversed(ancestors):
         if ancestor.attrib.get("clickable") == "true" and \
            _is_visible(ancestor.attrib.get("bounds", "")):
@@ -235,7 +298,7 @@ def _find_clickable_ancestor(root, target_node):
 
 
 def page_contains(keyword, timeout=MAX_WAIT_SECONDS):
-    """等待页面包含指定文本（验证页面加载）"""
+    """等待页面出现包含 keyword 的可见文本（用于验证页面加载）"""
     end = time.time() + timeout
     while time.time() < end:
         root, _, _ = get_latest_ui()
@@ -250,10 +313,7 @@ def page_contains(keyword, timeout=MAX_WAIT_SECONDS):
 
 
 def wait_for_element(keyword, timeout_seconds=MAX_WAIT_SECONDS, clickable_only=True):
-    """
-    等待并返回匹配关键词的元素坐标。
-    clickable_only=True: 仅匹配可点击元素（推荐用于点击操作）
-    """
+    """等待元素出现并返回坐标"""
     end_time = time.time() + timeout_seconds
     while time.time() < end_time:
         root, _, _ = get_latest_ui()
@@ -281,11 +341,14 @@ def wait_for_element(keyword, timeout_seconds=MAX_WAIT_SECONDS, clickable_only=T
     return {"Found": False}
 
 
+# ============================================================
+# 点击 / 滑动 / 坐标操作
+# ============================================================
+
 def click_by_text(keyword, wait_time=1000, retries=MAX_RETRIES, verify_page_keyword=None):
     """
-    通过文本匹配点击元素。
-    - verify_page_keyword: 点击后验证页面是否包含此文本（用于确认跳转成功）
-    返回 True/False
+    文本匹配点击。这是最常用的点击方式（自适应，不依赖像素坐标）。
+    verify_page_keyword: 点击后验证页面是否包含该文本
     """
     for i in range(retries):
         print(f"[尝试 {i + 1}/{retries}] 点击包含: '{keyword}'")
@@ -310,14 +373,14 @@ def click_by_text(keyword, wait_time=1000, retries=MAX_RETRIES, verify_page_keyw
 
 
 def click_by_coords(x, y, wait_time=1000):
-    """通过坐标点击（优先使用相对坐标的 tap_rel 函数）"""
+    """绝对坐标点击（仅用于盲点场景，如时间选择器右侧箭头）"""
     print(f"[点击坐标] ({x:.0f}, {y:.0f})")
     run_adb("shell", "input", "tap", str(int(x)), str(int(y)), check=False)
     time.sleep(wait_time / 1000)
 
 
 def tap_rel(rx, ry, wait_time=1000):
-    """通过相对坐标点击 (rx, ry 是 0~1 的比例)"""
+    """相对坐标点击 (rx, ry ∈ 0~1)"""
     _, sw, sh = get_latest_ui()
     if sw is None:
         sw, sh = 1264, 2780
@@ -326,7 +389,7 @@ def tap_rel(rx, ry, wait_time=1000):
 
 
 def swipe(x1, y1, x2, y2, duration=500, wait_time=1000):
-    """滑动操作（绝对像素）"""
+    """绝对像素滑动"""
     print(f"[滑动] ({x1:.0f}, {y1:.0f}) → ({x2:.0f}, {y2:.0f}) {duration}ms")
     run_adb("shell", "input", "swipe", str(int(x1)), str(int(y1)),
             str(int(x2)), str(int(y2)), str(duration), check=False)
@@ -334,7 +397,7 @@ def swipe(x1, y1, x2, y2, duration=500, wait_time=1000):
 
 
 def swipe_rel(rx1, ry1, rx2, ry2, duration=500, wait_time=1000):
-    """通过相对坐标滑动"""
+    """相对坐标滑动 — 换设备时调整 SCROLL_* 常量即可"""
     _, sw, sh = get_latest_ui()
     if sw is None:
         sw, sh = 1264, 2780
@@ -342,7 +405,11 @@ def swipe_rel(rx1, ry1, rx2, ry2, duration=500, wait_time=1000):
 
 
 def click_all_matched(keyword, wait_per_click=800, timeout_seconds=MAX_WAIT_SECONDS):
-    """批量点击当前页面所有匹配关键词的可见元素（跳过 (0,0) 坐标）"""
+    """
+    批量点击当前页所有匹配 keyword 的可见元素。
+    自动跳过 (0,0) 坐标（WebView 屏幕外元素）。
+    注意：此函数仅处理当前可见页，不滑动。
+    """
     end_time = time.time() + timeout_seconds
     has_click = False
 
@@ -365,10 +432,9 @@ def click_all_matched(keyword, wait_per_click=800, timeout_seconds=MAX_WAIT_SECO
                 continue
             cx, cy = center
             if cx == 0 and cy == 0:
-                continue  # 跳过无效坐标
+                continue
 
             text = node.attrib.get("text", "")
-            # 尝试找可点击的父节点
             clickable = _find_clickable_ancestor(root, node)
             if clickable is not None:
                 p_center = parse_bounds(clickable.attrib.get("bounds", ""))
@@ -387,14 +453,13 @@ def click_all_matched(keyword, wait_per_click=800, timeout_seconds=MAX_WAIT_SECO
 
 
 def find_element_center(keyword, visible_only=True):
-    """查找元素中心坐标，不点击。返回 (cx, cy, text) 或 None"""
+    """查找元素中心坐标（不点击），返回 (cx, cy, text) 或 None"""
     root, _, _ = get_latest_ui()
     if root is None:
         return None
     result = find_clickable_by_text(root, keyword, visible_only)
     if result:
         return result[2], result[3], result[1]
-    # 回退：查找任意包含文本的元素
     nodes = find_nodes_by_text(root, keyword, visible_only)
     if nodes:
         center = parse_bounds(nodes[0].attrib.get("bounds", ""))
@@ -405,60 +470,62 @@ def find_element_center(keyword, visible_only=True):
 
 def verify_image_uploaded(section_keyword):
     """
-    验证指定区域（如 '隐患图片' 或 '整改后图片'）是否已有上传的图片。
-    通过检查该区域附近是否有 Image 节点（含 UUID 的 text）。
+    验证「隐患图片」或「整改后图片」区域是否已有上传的图片。
+    在该区域下方 200px 内查找 Image 节点（其 text 为 UUID，长度 > 20）。
     """
     root, _, _ = get_latest_ui()
     if root is None:
         return False
 
-    # 找 section 节点
     section_nodes = [n for n in root.iter("node")
                      if section_keyword in n.attrib.get("text", "")
                      and _is_visible(n.attrib.get("bounds", ""))]
     if not section_nodes:
         return False
 
-    section_y = int(section_nodes[0].attrib.get("bounds", "").split("][")[0].split(",")[1])
+    # 获取 section 的 y 坐标
+    section_bounds = section_nodes[0].attrib.get("bounds", "")
+    m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', section_bounds)
+    if not m:
+        return False
+    sy = int(m.group(2))
 
-    # 在 section 下方找 Image 节点
     for node in root.iter("node"):
         if node.attrib.get("class", "").endswith("Image"):
             bounds = node.attrib.get("bounds", "")
             if _is_visible(bounds):
-                img_y = int(bounds.split("][")[0].split(",")[1])
-                # Image 应该在 section 下方 200px 以内
-                if 0 < img_y - section_y < 200:
-                    text = node.attrib.get("text", "")
-                    if text and len(text) > 20:  # UUID 样式
-                        print(f"  [验证] 图片已上传: {text[:36]}...")
-                        return True
+                m2 = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', bounds)
+                if m2:
+                    img_y = int(m2.group(2))
+                    if 0 < img_y - sy < 200:
+                        text = node.attrib.get("text", "")
+                        if text and len(text) > 20:   # UUID
+                            print(f"  [验证] 图片已上传: {text[:36]}...")
+                            return True
     return False
 
 
-# ======================================
-# 高级操作
-# ======================================
+# ============================================================
+# 高级操作函数
+# ============================================================
+
 def _click_nearest_upload_btn(section_keyword):
     """
-    找到离 section_keyword 最近的「附件最大不超过10M」按钮并点击。
-    （页面上有两个上传按钮：隐患图片 和 整改后图片，需要点对）
+    在隐患详情页上，有两个「附件最大不超过10M」按钮（隐患图片 / 整改后图片）。
+    此函数找到离 section_keyword 最近且在它下方的那个按钮并点击。
     """
     root, _, _ = get_latest_ui()
     if root is None:
         return False
 
-    # 找到 section 节点的 y 坐标
     section_y = None
     for node in _iter_all_nodes(root):
         if section_keyword in node.attrib.get("text", "") and _is_visible(node.attrib.get("bounds", "")):
-            bounds = node.attrib.get("bounds", "")
-            m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', bounds)
+            m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', node.attrib.get("bounds", ""))
             if m:
                 section_y = int(m.group(2))
                 break
 
-    # 找到所有「附件最大不超过10M」可点击节点
     upload_btns = []
     for node in _iter_all_nodes(root):
         if "附件最大不超过10M" in node.attrib.get("text", "") and _is_visible(node.attrib.get("bounds", "")):
@@ -471,16 +538,14 @@ def _click_nearest_upload_btn(section_keyword):
         return False
 
     if section_y is not None and len(upload_btns) > 1:
-        # 选择 y 坐标在 section 下方且最近的那个
         best = None
         best_dist = float('inf')
-        for center, node in upload_btns:
+        for center, _ in upload_btns:
             dist = center[1] - section_y
-            if 0 < dist < best_dist:  # 必须在 section 下方
+            if 0 < dist < best_dist:
                 best_dist = dist
                 best = center
         if best is None:
-            # 没有在 section 下方的，选 y 最小的
             upload_btns.sort(key=lambda x: x[0][1])
             best = upload_btns[0][0]
     else:
@@ -493,45 +558,36 @@ def _click_nearest_upload_btn(section_keyword):
 
 def upload_image(section_keyword, tap_rx, tap_ry, screenshot_label="upload"):
     """
-    完整的图片上传流程：
-    1. 找到离 section_keyword 最近的「附件最大不超过10M」并点击
-    2. 在弹出的对话框中选择「照片和视频」
-    3. 在图片选择器中点击指定相对坐标的图片
-    4. 选中「原图」
-    5. 点击「发送」
-    6. 验证图片 UUID 是否出现
+    一次完整的图片上传流程：
+    ① 点击离 section_keyword 最近的「附件最大不超过10M」→
+    ② 弹出对话框，选「照片和视频」→
+    ③ 图库中用 tap_rx/tap_ry 盲点图片（换设备需调这俩参数）→
+    ④ 选「原图」→ ⑤ 点「发送」→ ⑥ 验证 UUID 出现
     """
     print(f"\n{'─' * 40}")
     print(f"[上传] 开始上传「{section_keyword}」图片")
 
-    # Step A: 找到离 section 最近的上传按钮并点击
     if not _click_nearest_upload_btn(section_keyword):
-        # 回退：文本匹配
         print(f"  [回退] 智能定位失败，使用文本匹配")
         if not click_by_text("附件最大不超过10M", wait_time=1500):
             print(f"  [回退] 文本匹配也失败，使用相对坐标")
             tap_rel(tap_rx, tap_ry, wait_time=1500)
 
-    # Step B: 选择「照片和视频」
     if not click_by_text("照片和视频", wait_time=2000):
         screenshot(f"{screenshot_label}_no_dialog")
         return False
 
-    # Step C: 在图片选择器中点击图片
     time.sleep(1)
     print(f"  [步骤] 选择图片 ({tap_rx*100:.0f}%, {tap_ry*100:.0f}%)")
-    tap_rel(tap_rx, tap_ry, wait_time=800)
+    tap_rel(tap_rx, tap_ry, wait_time=800)  # 盲点图库中的图片
 
-    # Step D: 选择「原图」
     if not click_by_text("原图", wait_time=500):
         print("  [警告] 未找到「原图」选项，可能已默认选中")
 
-    # Step E: 点击「发送」
     if not click_by_text("发送", wait_time=3000):
         screenshot(f"{screenshot_label}_no_send")
         return False
 
-    # Step F: 等待并验证上传结果
     time.sleep(2)
     if verify_image_uploaded(section_keyword):
         print(f"[上传] [OK] 「{section_keyword}」上传成功")
@@ -539,7 +595,6 @@ def upload_image(section_keyword, tap_rx, tap_ry, screenshot_label="upload"):
     else:
         print(f"[上传] [!!] 「{section_keyword}」未检测到上传结果，检查截图")
         screenshot(f"{screenshot_label}_verify")
-        # 再等一下试试
         time.sleep(2)
         if verify_image_uploaded(section_keyword):
             print(f"[上传] [OK] 二次确认成功")
@@ -549,19 +604,18 @@ def upload_image(section_keyword, tap_rx, tap_ry, screenshot_label="upload"):
 
 def navigate_to_business_list():
     """
-    自适应导航到企业列表页（「专项巡查记录」-待办）。
-    检测当前页面状态，只执行必要的导航步骤。
+    自适应导航到企业列表页（「专项巡查记录」）。
+    检测当前页面，只执行必要的返回操作。
     """
     print("\n" + "=" * 50)
     print("[导航] 检查当前页面状态...")
 
-    # 先检查是否已在目标页面
     if page_contains("专项巡查记录", timeout=2) and page_contains("待办", timeout=1):
         print("[导航] [OK] 已在企业列表页，跳过导航")
         return True
 
     if page_contains("巡查项", timeout=1):
-        print("[导航] [!!] 当前在巡查表单页，按返回键回到列表")
+        print("[导航] 当前在巡查表单页，按返回键回到列表")
         run_adb("shell", "input", "keyevent", "4", check=False)
         time.sleep(1.5)
         if page_contains("专项巡查记录", timeout=3):
@@ -569,7 +623,7 @@ def navigate_to_business_list():
             return True
 
     if page_contains("自行处置", timeout=1) or page_contains("隐患信息", timeout=1):
-        print("[导航] [!!] 当前在隐患详情页，按两次返回键回到列表")
+        print("[导航] 当前在隐患详情页，按两次返回键回到列表")
         for _ in range(2):
             run_adb("shell", "input", "keyevent", "4", check=False)
             time.sleep(1)
@@ -577,15 +631,14 @@ def navigate_to_business_list():
             print("[导航] [OK] 已返回企业列表页")
             return True
 
-    # 需要从头导航
     print("[导航] 开始导航到企业列表...")
     for keyword, wait_ms, desc in NAV_STEPS:
         if page_contains("专项巡查记录", timeout=1) and page_contains("待办", timeout=1):
             print(f"[导航] 已到达企业列表，跳过剩余步骤")
             return True
         if not click_by_text(keyword, wait_time=wait_ms):
-            print(f"[导航] [!!] 「{desc}」({keyword}) 未找到，尝试继续...")
-    # 导航结束后检查
+            print(f"[导航] 「{desc}」({keyword}) 未找到，尝试继续...")
+
     if page_contains("专项巡查记录", timeout=3):
         print("[导航] [OK] 到达企业列表页")
         return True
@@ -597,31 +650,37 @@ def navigate_to_business_list():
 
 def click_first_business():
     """
-    点击列表中第一家企业。
-    优先通过文本匹配点击企业名，失败则用第一项 bounds 计算坐标。
+    在「待办」列表中点击第一家企业。
+    ① 直接点击「待办」tab（已在待办时点一下也无害，确保不在已完成/全部）
+    ② 用企业名关键词匹配第一家企业
+    ③ 匹配失败则用 bounds 尺寸特征找列表项（高度 200-300px、全宽、y>500）
     """
+    # 直接切到待办，不做下划线判断（避免误判）
+    click_by_text("待办", wait_time=1000)
+    time.sleep(0.5)
+
     root, _, _ = get_latest_ui()
     if root is None:
         return False
 
-    # 企业名特征：包含"商行"、"店"、"厂"等，且在可点击的 View 中
-    # 策略：找所有可点击的 View 中第一个包含企业名特征的
+    # 用企业名特征匹配
     business_keywords = ["商行", "加工厂", "店", "厂", "公司"]
     for kw in business_keywords:
         result = find_clickable_by_text(root, kw)
         if result:
             _, text, cx, cy = result
+            # 验证 y 坐标在合理范围（企业列表在 tab 下方 y>580）
+            if cy < 580:
+                continue
             print(f"[企业] 点击: '{text}' @ ({cx:.0f}, {cy:.0f})")
             run_adb("shell", "input", "tap", str(int(cx)), str(int(cy)), check=False)
             time.sleep(2)
-            # 验证是否进入了巡查项页面
             if page_contains("巡查项", timeout=3) or page_contains("巡查对象", timeout=2):
                 print("[企业] [OK] 进入巡查表单")
                 return True
 
-    # 回退：用第一个可见的可点击列表项的 bounds
+    # 回退：找第一个可见、宽屏、200~300px 高的 clickable 区域（列表项特征）
     print("[企业] 未匹配到企业名，尝试用第一个列表项...")
-    # 找 [0,623] 附近的第一个可见大块可点击区域
     for node in root.iter("node"):
         if node.attrib.get("clickable") == "true":
             bounds = node.attrib.get("bounds", "")
@@ -629,8 +688,7 @@ def click_first_business():
                 m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', bounds)
                 if m:
                     y1, y2 = int(m.group(2)), int(m.group(4))
-                    # 列表项高度一般在 200-300，且在页面中上部
-                    if 150 < y2 - y1 < 400 and y1 > 500:
+                    if 150 < y2 - y1 < 400 and y1 > 580:
                         cx = (int(m.group(1)) + int(m.group(3))) // 2
                         cy = (int(m.group(2)) + int(m.group(4))) // 2
                         print(f"[企业] 点击列表项 @ ({cx}, {cy})")
@@ -644,114 +702,421 @@ def click_first_business():
     return False
 
 
-def fill_form_first_problem():
-    """填写第一个问题：选择「是」→「自行处置」"""
-    print(f"\n{'─' * 40}")
-    print("[表单] 填写第一个问题")
+def scroll_to_problem(keyword, max_swipes=15):
+    """
+    滑动巡查表单直到问题文本 AND 至少一个选项（是/否）都可见。
+    双重验证防止「文本可见但选项在屏幕外」导致点错问题。
+    使用 SCROLL_DOWN 范围 (80%→20%)。
+    """
+    for _ in range(max_swipes):
+        root, _, _ = get_latest_ui()
+        if root is None:
+            continue
 
-    if not click_by_text("是", wait_time=1500):
+        problem_y = None
+        for node in _iter_all_nodes(root):
+            if keyword in node.attrib.get("text", "") and _is_visible(node.attrib.get("bounds", "")):
+                m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', node.attrib.get("bounds", ""))
+                if m:
+                    problem_y = int(m.group(4))
+                    break
+
+        if problem_y is not None:
+            for node in _iter_all_nodes(root):
+                if node.attrib.get("text") in ("是", "否") and _is_visible(node.attrib.get("bounds", "")):
+                    m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', node.attrib.get("bounds", ""))
+                    if m:
+                        opt_y = int(m.group(2))
+                        if 0 < opt_y - problem_y < 500:
+                            print(f"  [定位] 问题 '{keyword}' + 选项均已可见 (文本 y={problem_y}, 选项 y={opt_y})")
+                            return True
+            print(f"  [定位] 文本可见但选项不可见(y={problem_y}), 继续滑动...")
+
+        swipe_rel(SCROLL_X, SCROLL_DOWN_START, SCROLL_X, SCROLL_DOWN_END, duration=500, wait_time=800)
+    print(f"  [!!] 未找到问题 '{keyword}' 或其选项")
+    return False
+
+
+def click_problem_answer(problem_keyword, choice="是"):
+    """
+    点击指定问题的选项（是/否/不涉及）。
+    先定位问题文本的 y 位置，再找下方最近的同名选项，
+    避免多个同名「是」时点错。
+    """
+    root, _, _ = get_latest_ui()
+    if root is None:
         return False
 
-    # 点击「是」后，处置按钮动态出现在该问题下方
-    if not click_by_text("自行处置", wait_time=2000):
+    problem_bottom = None
+    for node in _iter_all_nodes(root):
+        if problem_keyword in node.attrib.get("text", "") and _is_visible(node.attrib.get("bounds", "")):
+            m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', node.attrib.get("bounds", ""))
+            if m:
+                problem_bottom = int(m.group(4))
+                break
+
+    if problem_bottom is None:
+        print(f"  [!!] 问题文本 '{problem_keyword}' 不可见")
         return False
 
-    # 验证进入隐患详情页
-    if page_contains("隐患信息", timeout=3) or page_contains("自行处置", timeout=2):
-        print("[表单] [OK] 进入隐患详情页")
-        return True
+    options = []
+    for node in _iter_all_nodes(root):
+        if node.attrib.get("text") == choice:
+            parent = _find_clickable_ancestor(root, node)
+            if parent is not None:
+                center = parse_bounds(parent.attrib.get("bounds", ""))
+                if center and center[0] > 0 and center[1] > 0:
+                    options.append((center[1], center))
 
-    print("[表单] [!!] 未能确认进入隐患详情页")
-    return True  # 即使验证失败也继续
+    if not options:
+        print(f"  [!!] 未找到可点击的 '{choice}'")
+        return False
+
+    # 选问题文本下方最近的那个选项
+    best = min(options, key=lambda x: x[0] - problem_bottom if x[0] > problem_bottom else float('inf'))
+    if best[0] <= problem_bottom:
+        best = min(options, key=lambda x: x[0])  # 回退：选最上面的
+
+    _, center = best
+    print(f"  [点选] '{problem_keyword}' → '{choice}' @ ({center[0]:.0f}, {center[1]:.0f})")
+    run_adb("shell", "input", "tap", str(int(center[0])), str(int(center[1])), check=False)
+    return True
 
 
-def fill_hazard_details():
-    """填写隐患分类详情：问题隐患类型 → 消防安全 → 出口、通道不畅通"""
+def _read_counter(root):
+    """读取巡查表单底部的 n/12 计数器"""
+    for node in _iter_all_nodes(root):
+        t = node.attrib.get("text", "")
+        m = re.match(r'(\d+)/(\d+)', t)
+        if m and _is_visible(node.attrib.get("bounds", "")):
+            return int(m.group(1)), int(m.group(2))
+    return 0, 12
+
+
+def _swipe_page_down():
+    """向下翻一页（80% → 20%）"""
+    swipe_rel(SCROLL_X, SCROLL_DOWN_START, SCROLL_X, SCROLL_DOWN_END, duration=500, wait_time=800)
+
+
+def _swipe_page_up():
+    """向上翻一页（20% → 80%）"""
+    swipe_rel(SCROLL_X, SCROLL_DOWN_END, SCROLL_X, SCROLL_DOWN_START, duration=500, wait_time=800)
+
+
+def fill_all_remaining_no():
+    """
+    对巡查表单剩余问题点击「否」。
+    判成败的核心标准是 n/12 计数器（表单系统自身统计，与 XML 可见性无关）。
+    逐题状态仅用于诊断输出，不作为成败依据。
+    如果 n < 12，最多重试 3 轮完整双向扫描。
+    """
+    total = 12
+    MAX_ROUNDS = 3  # 最多重试 3 轮
+
+    # 所有 12 题的关键词（诊断用——仅反映扫描到的快照，不可见的问题无法判断）
+    ALL_KEYWORDS = {
+        1: "出口、通道", 2: "三合一", 3: "餐饮", 4: "违规用电",
+        5: "电气线路", 6: "电动自行车", 7: "防盗窗", 8: "消火栓",
+        9: "灭火器", 10: "电气焊", 11: "易燃易爆", 12: "其他隐患",
+    }
+
+    reported_nums = {p["num"] for p in PROBLEMS_TO_REPORT}
+
+    # ================================================================
+    # 核心：在当前页面对所有可见「否」点击（跳过有「关联事件」的）
+    # ================================================================
+    def _click_visible_no(root):
+        """点击当前页所有可见的「否」（跳过关联事件旁的）"""
+        # 收集「关联事件」y 坐标
+        markers_y = []
+        for node in _iter_all_nodes(root):
+            if "关联事件" in node.attrib.get("text", "") and _is_visible(node.attrib.get("bounds", "")):
+                m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', node.attrib.get("bounds", ""))
+                if m:
+                    markers_y.append(int(m.group(2)))
+
+        # 点击「否」
+        clicked = 0
+        for node in _iter_all_nodes(root):
+            if node.attrib.get("text") == "否" and _is_visible(node.attrib.get("bounds", "")):
+                parent = _find_clickable_ancestor(root, node)
+                if parent is not None:
+                    c = parse_bounds(parent.attrib.get("bounds", ""))
+                    if c and c[0] > 0 and c[1] > 0:
+                        if not any(abs(c[1] - my) < 300 for my in markers_y):
+                            run_adb("shell", "input", "tap", str(int(c[0])), str(int(c[1])), check=False)
+                            clicked += 1
+                            time.sleep(0.6)
+        return clicked
+
+    # ================================================================
+    # 诊断：扫描当前页，尝试识别可见问题（尽力而为，不保证完整）
+    # ================================================================
+    def _diagnose_page(root, observed):
+        """尽力检测可见问题的「是」状态（仅检测关联事件标记，不检测否）"""
+        for num, kw in ALL_KEYWORDS.items():
+            if observed[num] is not None:
+                continue  # 已确认过
+            prob_node = None
+            for node in _iter_all_nodes(root):
+                if kw in node.attrib.get("text", "") and _is_visible(node.attrib.get("bounds", "")):
+                    prob_node = node
+                    break
+            if prob_node is None:
+                continue
+            m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', prob_node.attrib.get("bounds", ""))
+            if not m:
+                continue
+            prob_yb = int(m.group(4))
+
+            # 检查「关联事件」
+            for node in _iter_all_nodes(root):
+                if "关联事件" in node.attrib.get("text", "") and _is_visible(node.attrib.get("bounds", "")):
+                    m2 = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', node.attrib.get("bounds", ""))
+                    if m2 and 0 < int(m2.group(2)) - prob_yb < 400:
+                        observed[num] = "是"
+                        break
+
+    # ================================================================
+    # 辅助：判断指定问题是否"完整可见"（题目文本 + 至少一个选项都在屏幕内）
+    # ================================================================
+    def _is_problem_fully_visible(root, num):
+        """检查问题 num 的文本和选项（是/否）是否都在可视区域"""
+        kw = ALL_KEYWORDS.get(num)
+        if not kw:
+            return False
+        prob_yb = None
+        for node in _iter_all_nodes(root):
+            if kw in node.attrib.get("text", "") and _is_visible(node.attrib.get("bounds", "")):
+                m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', node.attrib.get("bounds", ""))
+                if m:
+                    prob_yb = int(m.group(4))
+                    break
+        if prob_yb is None:
+            return False
+        # 检查下方 500px 内是否有可见的「是」或「否」
+        for node in _iter_all_nodes(root):
+            if node.attrib.get("text") in ("是", "否") and _is_visible(node.attrib.get("bounds", "")):
+                m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', node.attrib.get("bounds", ""))
+                if m and 0 < int(m.group(2)) - prob_yb < 500:
+                    return True
+        return False
+
+    # ================================================================
+    # 一轮双向扫描：以问题1/12的可见性为边界标志
+    # ================================================================
+    def _one_round():
+        """执行一轮完整双向扫描，返回 (final_n, total_clicked)。
+        退出条件以计数器 n>=12 为准（权威），边界检测只是辅助日志。"""
+        total_clicked = 0
+
+        # ── Pass 1: 滑到顶部（问题1完整可见 或 计数器不再变化） ──
+        prev_n = -1
+        for _ in range(20):
+            root, _, _ = get_latest_ui()
+            if root is not None and _is_problem_fully_visible(root, 1):
+                print("    到顶: 问题1可见", flush=True)
+                break
+            if root is not None:
+                n, _ = _read_counter(root)
+                if n == prev_n and prev_n > 0:
+                    break  # 页面不再变化
+                prev_n = n
+            _swipe_page_up()
+
+        # ── Pass 2: 从上到下扫描，计数器满 12 即退出 ──
+        prev_n = -1
+        stuck = 0
+        for _ in range(30):
+            root, _, _ = get_latest_ui()
+            if root is None:
+                continue
+            n, _ = _read_counter(root)
+            c = _click_visible_no(root)
+            total_clicked += c
+            at_bottom = _is_problem_fully_visible(root, 12)
+            print(f"    [{n}/{total}] 点{c}个 {'▼' if at_bottom else ''}", flush=True)
+
+            if n >= total:
+                print(f"    计数器已满 {n}/{total}, 退出")
+                return n, total_clicked
+
+            # 防卡死：如果计数器连续 3 页不变且无点击，提前退出
+            if n == prev_n and c == 0:
+                stuck += 1
+                if stuck >= 3:
+                    print(f"    页面无变化({stuck}次), 提前结束本方向")
+                    break
+            else:
+                stuck = 0
+            prev_n = n
+            _swipe_page_down()
+
+        # ── Pass 3: 从下到上回扫 ──
+        prev_n = -1
+        stuck = 0
+        for _ in range(30):
+            root, _, _ = get_latest_ui()
+            if root is None:
+                continue
+            n, _ = _read_counter(root)
+            c = _click_visible_no(root)
+            total_clicked += c
+            print(f"    [{n}/{total}] 点{c}个", flush=True)
+
+            if n >= total:
+                print(f"    计数器已满 {n}/{total}, 退出")
+                return n, total_clicked
+
+            if n == prev_n and c == 0:
+                stuck += 1
+                if stuck >= 3:
+                    break
+            else:
+                stuck = 0
+            prev_n = n
+            _swipe_page_up()
+
+        root, _, _ = get_latest_ui()
+        n, _ = _read_counter(root) if root is not None else (0, total)
+        return n, total_clicked
+
+    # ================================================================
+    # 主逻辑
+    # ================================================================
     print(f"\n{'─' * 40}")
-    print("[详情] 填写隐患分类")
+    print("[批量] 扫描填写剩余「否」...")
 
-    # 先滚动到表单底部（「事件基础信息」区域）
-    # 使用相对坐标：从屏幕中间偏下向上滑动
-    swipe_rel(0.27, 0.63, 0.27, 0.05, duration=800, wait_time=1500)
+    final_n = 0
+    total_clicked = 0
+    for rd in range(1, MAX_ROUNDS + 1):
+        root, _, _ = get_latest_ui()
+        if root is not None:
+            n, _ = _read_counter(root)
+            if n >= total:
+                final_n = n
+                break
+        print(f"  第 {rd}/{MAX_ROUNDS} 轮扫描...")
+        final_n, clicked = _one_round()
+        total_clicked += clicked
+        if final_n >= total:
+            break
+        print(f"  本轮结束: {final_n}/{total}, 重试...")
+        time.sleep(1)
 
-    # 检查「问题隐患类型」是否可见
+    # ================================================================
+    # 最终验证 + 诊断汇总
+    # ================================================================
+    print(f"\n{'─' * 40}")
+
+    # 硬判：以计数器为准
+    if final_n >= total:
+        print(f"[批量] [OK] 计数器 {final_n}/{total} — 全部填写完毕")
+    else:
+        print(f"[批量] [!!] 计数器 {final_n}/{total} — 可能不完整 (共点击 {total_clicked} 次)")
+        screenshot("incomplete_scan")
+
+    # 诊断：仅在不完整时才滑动检查（完整时直接跳过，避免无效滑动）
+    if final_n < total:
+        observed = {num: None for num in range(1, total + 1)}
+        for _ in range(10):
+            _swipe_page_down()
+        root, _, _ = get_latest_ui()
+        if root is not None:
+            _diagnose_page(root, observed)
+        for _ in range(15):
+            _swipe_page_up()
+        root, _, _ = get_latest_ui()
+        if root is not None:
+            _diagnose_page(root, observed)
+
+        print(f"\n[诊断] 观察到的题目状态 (仅供参考):")
+        for num in range(1, total + 1):
+            st = observed[num]
+            if num in reported_nums:
+                display = st if st else "?"
+                flag = "[OK]" if st == "是" else "[!!]"
+                print(f"  问题{num:>2}: {display:<6} (预期是) {flag}")
+            else:
+                display = st if st else "?"
+                print(f"  问题{num:>2}: {display:<6} (预期否) [?]")
+
+
+def fill_hazard_details(hazard_category="消防安全", hazard_subcategory="出口、通道不畅通"):
+    """
+    填写隐患详情页：分类选择 → 整改用时 → 确认提交。
+    hazard_category / hazard_subcategory 需匹配分类选择器中的实际文本。
+    """
+    print(f"\n{'─' * 40}")
+    print(f"[详情] 填写隐患分类: {hazard_category} → {hazard_subcategory}")
+
+    # 滚到底部（「事件基础信息」区域）
+    swipe_rel(SCROLL_X, SCROLL_BIG_START, SCROLL_X, SCROLL_BIG_END, duration=800, wait_time=1500)
+
     if not page_contains("问题隐患类型", timeout=2):
-        print("[详情] [!!] 「问题隐患类型」不可见，再次滑动")
-        swipe_rel(0.27, 0.63, 0.27, 0.05, duration=800, wait_time=1000)
+        print("[详情] 「问题隐患类型」不可见，再次滑动")
+        swipe_rel(SCROLL_X, SCROLL_BIG_START, SCROLL_X, SCROLL_BIG_END, duration=800, wait_time=1000)
 
-    # 点击「请选择」旁边的区域来打开分类选择器
-    # 「问题隐患类型」行有一个可点击的下拉箭头
+    # 点击分类选择器右侧箭头
     result = find_element_center("问题隐患类型")
     if result:
         _, cy, _ = result
-        # 「请选择」/箭头通常在右侧，点击下拉箭头
         _, sw2, _ = get_latest_ui()
         if sw2:
-            click_by_coords(sw2 * 0.92, cy, wait_time=1500)
+            click_by_coords(sw2 * FIELD_RIGHT_CLICK_RX, cy, wait_time=1500)
     else:
-        # 回退：点击「请选择」
         click_by_text("请选择", wait_time=1500)
 
-    # 选择分类「消防安全」
-    if not click_by_text("消防安全", wait_time=1500):
-        screenshot("no_fire_safety")
+    # 选大类 → 子类
+    if not click_by_text(hazard_category, wait_time=1500):
+        screenshot("no_category")
+        return False
+    if not click_by_text(hazard_subcategory, wait_time=1000):
+        screenshot("no_subcategory")
         return False
 
-    # 选择子分类「出口、通道不畅通」
-    if not click_by_text("出口、通道不畅通", wait_time=1000):
-        screenshot("no_sub_category")
-        return False
-
-    # 关闭分类选择器（点击空白区域或等待自动关闭）
     time.sleep(0.5)
 
-    # 验证分类是否已选中
-    if page_contains("出口、通道不畅通", timeout=2):
-        print("[详情] [OK] 隐患分类已填写: 消防安全 → 出口、通道不畅通")
+    if page_contains(hazard_subcategory, timeout=2):
+        print(f"[详情] [OK] 隐患分类: {hazard_category} → {hazard_subcategory}")
     else:
         print("[详情] [!!] 分类选择结果未确认")
 
-    # ─── 填写隐患整改用时 ───
-    # 分类选择器关闭后，需要再往下滑找到「隐患整改用时」字段
+    # ── 填写隐患整改用时 ──
     print("[详情] 填写隐患整改用时...")
     for _ in range(3):
         if page_contains("隐患整改用时", timeout=1):
             break
-        swipe_rel(0.27, 0.75, 0.27, 0.20, duration=300, wait_time=800)
+        swipe_rel(SCROLL_X, SCROLL_DOWN_START, SCROLL_X, SCROLL_DOWN_END, duration=300, wait_time=800)
 
     if not page_contains("隐患整改用时", timeout=2):
         print("[详情] [!!] 未找到「隐患整改用时」字段，跳过")
         return True
 
-    # 点击「隐患整改用时」的「请选择」打开时间选择器
     result = find_element_center("隐患整改用时")
     if result:
         _, cy, _ = result
         _, sw2, _ = get_latest_ui()
         if sw2:
-            click_by_coords(sw2 * 0.92, cy, wait_time=1500)
+            click_by_coords(sw2 * FIELD_RIGHT_CLICK_RX, cy, wait_time=1500)
     else:
         click_by_text("隐患整改用时", wait_time=1000)
-        # 再点一次「请选择」
         click_by_text("请选择", wait_time=500)
 
-    # 等待时间选择器弹出
+    # ── 时间选择器 ──
     if page_contains("时", timeout=2) and page_contains("分", timeout=1):
-        print("  [时间选择器] 已打开，设置整改用时 ~20分")
-        # 滑动分钟列设置时间值
-        # 原始坐标: (979,2460) -> (979,300) dy=-2160 ≈ 20分钟
-        # 相对坐标: rx≈0.77, ry≈0.885 → 0.108
-        # 分钟列 x 范围 630-1264, 中心约 947
-        swipe_rel(0.77, 0.885, 0.77, 0.11, duration=1000, wait_time=1000)
-        # 点击「完成」(中心 y≈1872, rx≈0.92)
+        target_minutes = random.randint(18, 23)
+        dy_rel = TIME_PICKER_BASE_DY_REL + (20 - target_minutes) * TIME_PICKER_PER_MINUTE_REL
+        ry_end = TIME_PICKER_RY_START + dy_rel
+        print(f"  [时间选择器] 设置整改用时 ~{target_minutes}分")
+        swipe_rel(TIME_PICKER_RX, TIME_PICKER_RY_START, TIME_PICKER_RX, ry_end, duration=1000, wait_time=1000)
         if page_contains("完成", timeout=1):
             click_by_text("完成", wait_time=1000)
             print("  [时间选择器] 已关闭")
     else:
         print("  [!!] 时间选择器未弹出")
 
-    # ─── 提交隐患项 ───
-    # 时间选择器关闭后，需要点击「确认」提交这个隐患详情
+    # ── 提交隐患项 ──
     time.sleep(1)
     if page_contains("确认", timeout=3):
         print("[详情] 点击「确认」提交隐患项...")
@@ -762,15 +1127,54 @@ def fill_hazard_details():
         print("[详情] [!!] 未找到「确认」按钮")
         screenshot("no_confirm_hazard")
         return False
+
+
+def fill_one_problem(problem_keyword, hazard_category, hazard_subcategory, problem_label=""):
+    """
+    一道题的完整流程：定位 → 是 → 自行处置 → 图片 → 分类 → 用时 → 确认。
+    """
+    label = f" [{problem_label}]" if problem_label else ""
+    print(f"\n{'=' * 50}")
+    print(f"[问题]{label} {problem_keyword}")
+    print(f"[分类] {hazard_category} → {hazard_subcategory}")
+
+    if not scroll_to_problem(problem_keyword):
+        return False
+    if not click_problem_answer(problem_keyword, "是"):
+        print(f"  [回退] click_problem_answer 失败，尝试 click_by_text")
+        if not click_by_text("是", wait_time=1500):
+            return False
+    time.sleep(1)
+
+    if not click_by_text("自行处置", wait_time=2000):
+        return False
+    if not page_contains("隐患信息", timeout=3) and not page_contains("自行处置", timeout=2):
+        print("  [!!] 未进入隐患详情页")
+        return False
+    print("  [OK] 进入隐患详情页")
+
+    upload_image("隐患图片", IMAGE_1_RX, IMAGE_1_RY, f"p{problem_label}_before")
+    # 滑动让「整改后图片」区域可见（隐患详情页较短，用大幅翻页）
+    swipe_rel(SCROLL_X, SCROLL_BIG_START, SCROLL_X, SCROLL_DOWN_END, duration=500, wait_time=1500)
+    if not page_contains("整改后图片", timeout=2):
+        swipe_rel(SCROLL_X, SCROLL_BIG_START, SCROLL_X, SCROLL_DOWN_END, duration=500, wait_time=1000)
+    upload_image("整改后图片", IMAGE_2_RX, IMAGE_2_RY, f"p{problem_label}_after")
+
+    return fill_hazard_details(hazard_category, hazard_subcategory)
+
+
+# ============================================================
+# 设备检查
+# ============================================================
+
 def check_device():
     """检查 ADB 和设备连接状态"""
     global ADB_PATH
 
     print("=" * 50)
-    print("应急消防巡查自动化脚本 - 智能版")
+    print("应急消防巡查自动化脚本")
     print("=" * 50)
 
-    # 尝试在 PATH 或当前目录找到 adb
     adb_found = False
     if os.path.exists(ADB_PATH):
         adb_found = True
@@ -788,7 +1192,6 @@ def check_device():
         input("按回车键退出")
         sys.exit(1)
 
-    # 检查设备连接
     try:
         result = subprocess.run([ADB_PATH, "devices"], capture_output=True, text=True, check=False)
         lines = [l for l in result.stdout.strip().split("\n") if l.strip()]
@@ -803,7 +1206,6 @@ def check_device():
         input("按回车键退出")
         sys.exit(1)
 
-    # 获取屏幕信息
     sw, sh = get_screen_size()
     print(f"[屏幕] {sw}×{sh}")
     print()
@@ -812,14 +1214,16 @@ def check_device():
     time.sleep(3)
 
 
-# ======================================
+# ============================================================
 # 主流程
-# ======================================
+# ============================================================
+
 def main():
     check_device()
     print(f"\n[开始] 执行自动化操作...")
+    print(f"[配置] 需报告的问题: {[p['num'] for p in PROBLEMS_TO_REPORT]}")
 
-    # ─── 阶段 1：导航 ───
+    # ── 阶段 1：导航 ──
     if not SKIP_NAVIGATION:
         if not navigate_to_business_list():
             print("[错误] 导航失败，终止执行")
@@ -829,87 +1233,68 @@ def main():
         if not page_contains("专项巡查记录", timeout=2):
             print("[警告] 当前不在企业列表页，可能出错")
 
-    # ─── 阶段 2：选择第一家企业 ───
+    # ── 阶段 2：选择企业 ──
     print(f"\n{'=' * 50}")
-    print("[阶段 2] 选择第一家企业进入巡查表单")
+    print("[阶段 2] 选择企业进入巡查表单")
     if not click_first_business():
         print("[错误] 无法进入巡查表单")
         return
 
-    # ─── 阶段 3：填写第一个问题 ───
+    # ── 阶段 3：逐题处理「是」的问题 ──
     print(f"\n{'=' * 50}")
-    print("[阶段 3] 填写第一个问题（是 → 自行处置）")
-    if not fill_form_first_problem():
-        print("[错误] 表单填写失败")
-        return
+    print(f"[阶段 3] 处理 {len(PROBLEMS_TO_REPORT)} 个需报告的问题")
+    for i, p in enumerate(PROBLEMS_TO_REPORT, 1):
+        print(f"\n{'#' * 40}")
+        print(f"# 问题 {i}/{len(PROBLEMS_TO_REPORT)}: #{p['num']} {p['keyword']}")
+        print(f"{'#' * 40}")
+        ok = fill_one_problem(
+            problem_keyword=p["keyword"],
+            hazard_category=p["category"],
+            hazard_subcategory=p["subcategory"],
+            problem_label=str(p["num"]),
+        )
+        if ok:
+            print(f"[进度] 问题 #{p['num']} [OK]")
+        else:
+            print(f"[进度] 问题 #{p['num']} [!!] 失败，尝试继续...")
+            screenshot(f"fail_problem_{p['num']}")
 
-    # ─── 阶段 4：上传整改前图片 ───
+    # ── 阶段 4：双向扫描填写剩余「否」 ──
     print(f"\n{'=' * 50}")
-    print("[阶段 4] 上传整改前图片")
-    # 图片上传区域在「隐患图片」行右侧
-    # 「附件最大不超过10M」可点击区域 ≈ (0.78, 0.58) 到 (0.98, 0.68)
-    upload_image("隐患图片", IMAGE_1_RX, IMAGE_1_RY, "before_fix")
+    print("[阶段 4] 逐页扫描填写剩余「否」")
 
-    # ─── 阶段 5：上传整改后图片 ───
-    print(f"\n{'=' * 50}")
-    print("[阶段 5] 上传整改后图片")
-    # 先滑动让「整改后图片」可见
-    swipe_rel(0.27, 0.63, 0.27, 0.30, duration=500, wait_time=1500)
-
-    # 检查「整改后图片」是否可见
-    if not page_contains("整改后图片", timeout=2):
-        print("[警告] 「整改后图片」不可见，尝试额外滑动")
-        swipe_rel(0.27, 0.63, 0.27, 0.20, duration=500, wait_time=1000)
-
-    upload_image("整改后图片", IMAGE_2_RX, IMAGE_2_RY, "after_fix")
-
-    # ─── 阶段 6：填写隐患分类详情 + 整改用时 + 提交 ───
-    print(f"\n{'=' * 50}")
-    print("[阶段 6] 填写隐患分类、整改用时、提交")
-    if not fill_hazard_details():
-        print("[警告] 隐患详情填写可能不完整")
-
-    # fill_hazard_details 已包含「确认」提交，提交后自动返回巡查表单
-    # ─── 阶段 7：批量填写 ───
-    print(f"\n{'=' * 50}")
-    print("[阶段 7] 批量填写当前页所有「否」")
-
-    # 确认已回到巡查表单
     if not page_contains("巡查项", timeout=2):
         print("[批量] 等待返回巡查表单...")
         time.sleep(3)
-        if not page_contains("巡查项", timeout=3):
-            print("[批量] [!!] 未能确认回到巡查表单，跳过批量填写")
 
-    if page_contains("巡查项", timeout=1):
-        print("[批量] [OK] 已回到巡查表单")
-        # 滑动 + 批量点击「否」
-        for _ in range(5):
-            swipe_rel(0.28, 0.52, 0.28, 0.08, duration=500, wait_time=1000)
-            click_all_matched("否", wait_per_click=800)
-            print()
+    if page_contains("巡查项", timeout=1) or page_contains("提交表单", timeout=1):
+        print("[批量] [OK] 在巡查表单，开始扫描")
+        fill_all_remaining_no()
     else:
-        print("[批量] [!!] 跳过批量填写")
+        print("[批量] [!!] 未在巡查表单，跳过")
 
-    # ─── 阶段 8：提交表单 ───
+    # ── 阶段 5：提交表单（AUTO_SUBMIT 控制） ──
     print(f"\n{'=' * 50}")
-    print("[阶段 8] 提交表单")
-    if page_contains("提交表单", timeout=2):
-        click_by_text("提交表单", wait_time=3000)
-        print("[提交] 表单已提交，等待确认弹窗...")
-        # 提交后出现汇总弹窗，点击「确认」最终提交
-        time.sleep(1)
-        if page_contains("确认", timeout=5):
-            click_by_text("确认", wait_time=5000)
-            print("[提交] [OK] 最终确认完成")
+    if AUTO_SUBMIT:
+        print("[阶段 5] 提交表单")
+        if page_contains("提交表单", timeout=2):
+            click_by_text("提交表单", wait_time=3000)
+            print("[提交] 表单已提交，等待确认弹窗...")
+            time.sleep(1)
+            if page_contains("确认", timeout=5):
+                click_by_text("确认", wait_time=5000)
+                print("[提交] [OK] 最终确认完成")
+            else:
+                print("[提交] [!!] 未找到确认弹窗")
+                screenshot("no_final_confirm")
         else:
-            print("[提交] [!!] 未找到确认弹窗的「确认」按钮")
-            screenshot("no_final_confirm")
+            print("[提交] [!!] 未找到「提交表单」按钮")
+            screenshot("no_submit")
     else:
-        print("[提交] [!!] 未找到「提交表单」按钮")
-        screenshot("no_submit")
+        print("[阶段 5] 提交表单 (已跳过 — AUTO_SUBMIT=False)")
+        print("[提示] 表单已填写完毕，请手动检查后提交")
 
-    # ─── 完成 ───
+    # ── 完成 ──
     print()
     print("=" * 50)
     print("[完成] 自动化操作执行完毕！")
