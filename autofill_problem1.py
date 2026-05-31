@@ -956,11 +956,15 @@ def fill_all_remaining_no():
 
             if n >= total:
                 return n, total_clicked
-            # 防卡死：计数器连续 3 页不变（无论有无点击）即退出
+            # 到底检测：问题12的文本可见
+            kw12 = ALL_KEYWORDS[12]
+            at_bottom = any(kw12 in node.attrib.get("text", "") and _is_visible(node.attrib.get("bounds", ""))
+                           for node in _iter_all_nodes(root))
+            # 防卡死：计数器停滞 或 已到底且无进展
             if n == prev_n:
                 stuck += 1
-                if stuck >= 3:
-                    print(f"    计数器停滞({stuck}页), 结束本方向")
+                if stuck >= 3 or (at_bottom and stuck >= 1):
+                    print(f"    停滞({stuck}页){' 已到底' if at_bottom else ''}, 结束")
                     break
             else:
                 stuck = 0
@@ -984,9 +988,13 @@ def fill_all_remaining_no():
 
             if n >= total:
                 return n, total_clicked
+            kw1 = ALL_KEYWORDS[1]
+            at_top = any(kw1 in node.attrib.get("text", "") and _is_visible(node.attrib.get("bounds", ""))
+                        for node in _iter_all_nodes(root))
             if n == prev_n:
                 stuck += 1
-                if stuck >= 3:
+                if stuck >= 3 or (at_top and stuck >= 1):
+                    print(f"    停滞({stuck}页){' 已到顶' if at_top else ''}, 结束")
                     break
             else:
                 stuck = 0
