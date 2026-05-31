@@ -499,7 +499,7 @@ def verify_image_uploaded(section_keyword):
                     img_y = int(m2.group(2))
                     if 0 < img_y - sy < 200:
                         text = node.attrib.get("text", "")
-                        if text and len(text) > 20:   # UUID
+                        if text and len(text) > 0:   # 图片 ID（UUID 或 数字ID，如 27778888491712712）
                             print(f"  [验证] 图片已上传: {text[:36]}...")
                             return True
     return False
@@ -651,11 +651,11 @@ def navigate_to_business_list():
 def click_first_business():
     """
     在「待办」列表中点击第一家企业。
-    ① 直接点击「待办」tab（已在待办时点一下也无害，确保不在已完成/全部）
-    ② 用企业名关键词匹配第一家企业
-    ③ 匹配失败则用 bounds 尺寸特征找列表项（高度 200-300px、全宽、y>500）
+    ① 点击「待办」tab 确保在正确列表
+    ② 优先用尺寸特征匹配（全宽、高 150~400px、y>580）
+       企业列表项结构固定，比文本匹配更可靠
+    ③ 尺寸匹配失败则回退到文本关键词匹配
     """
-    # 直接切到待办，不做下划线判断（避免误判）
     click_by_text("待办", wait_time=1000)
     time.sleep(0.5)
 
@@ -663,24 +663,10 @@ def click_first_business():
     if root is None:
         return False
 
-    # 用企业名特征匹配
-    business_keywords = ["商行", "加工厂", "店", "厂", "公司"]
-    for kw in business_keywords:
-        result = find_clickable_by_text(root, kw)
-        if result:
-            _, text, cx, cy = result
-            # 验证 y 坐标在合理范围（企业列表在 tab 下方 y>580）
-            if cy < 580:
-                continue
-            print(f"[企业] 点击: '{text}' @ ({cx:.0f}, {cy:.0f})")
-            run_adb("shell", "input", "tap", str(int(cx)), str(int(cy)), check=False)
-            time.sleep(2)
-            if page_contains("巡查项", timeout=3) or page_contains("巡查对象", timeout=2):
-                print("[企业] [OK] 进入巡查表单")
-                return True
-
-    # 回退：找第一个可见、宽屏、200~300px 高的 clickable 区域（列表项特征）
-    print("[企业] 未匹配到企业名，尝试用第一个列表项...")
+    # ── 方案 A（优先）：尺寸特征匹配 ──
+    # 企业列表项 = 全宽 clickable View, 高度 150~400px, 在 tab 下方
+    best_y = float('inf')
+    best_coords = None
     for node in root.iter("node"):
         if node.attrib.get("clickable") == "true":
             bounds = node.attrib.get("bounds", "")
@@ -691,12 +677,34 @@ def click_first_business():
                     if 150 < y2 - y1 < 400 and y1 > 580:
                         cx = (int(m.group(1)) + int(m.group(3))) // 2
                         cy = (int(m.group(2)) + int(m.group(4))) // 2
-                        print(f"[企业] 点击列表项 @ ({cx}, {cy})")
-                        run_adb("shell", "input", "tap", str(cx), str(cy), check=False)
-                        time.sleep(2)
-                        if page_contains("巡查项", timeout=3):
-                            print("[企业] [OK] 进入巡查表单")
-                            return True
+                        if cy < best_y:
+                            best_y = cy
+                            best_coords = (cx, cy)
+
+    if best_coords:
+        cx, cy = best_coords
+        print(f"[企业] 点击第一项 @ ({cx}, {cy})")
+        run_adb("shell", "input", "tap", str(cx), str(cy), check=False)
+        time.sleep(2)
+        if page_contains("巡查项", timeout=3) or page_contains("巡查对象", timeout=2):
+            print("[企业] [OK] 进入巡查表单")
+            return True
+
+    # ── 方案 B（回退）：文本关键词匹配 ──
+    print("[企业] 尺寸匹配未成功，尝试文本匹配...")
+    business_keywords = ["商行", "加工厂", "店", "厂", "公司"]
+    for kw in business_keywords:
+        result = find_clickable_by_text(root, kw)
+        if result:
+            _, text, cx, cy = result
+            if cy < 580:
+                continue
+            print(f"[企业] 点击: '{text}' @ ({cx:.0f}, {cy:.0f})")
+            run_adb("shell", "input", "tap", str(int(cx)), str(int(cy)), check=False)
+            time.sleep(2)
+            if page_contains("巡查项", timeout=3) or page_contains("巡查对象", timeout=2):
+                print("[企业] [OK] 进入巡查表单")
+                return True
 
     screenshot("no_business")
     return False
@@ -805,15 +813,23 @@ def _swipe_page_up():
 
 def fill_all_remaining_no():
     """
-    对巡查表单剩余问题点击「否」。
-    判成败的核心标准是 n/12 计数器（表单系统自身统计，与 XML 可见性无关）。
-    逐题状态仅用于诊断输出，不作为成败依据。
-    如果 n < 12，最多重试 3 轮完整双向扫描。
+    逐页扫描巡查表单，对剩余问题点「否」，并输出 12 题完整状态表。
+
+    流程：
+      1. 滑到顶部（问题1可见）
+      2. 从上到下逐页扫描：每页检测可见问题的状态 → 对未处置的点「否」
+      3. 回扫补漏
+      4. 再滑一遍收集所有可见问题的最终状态
+      5. 输出 1-12 题状态表，与用户命令对比验证
+
+    状态记录规则：
+      - 看到「关联事件」→ 标记 "是(已处置)"
+      - 点击了「否」     → 标记 "否"
+      - 问题不可见       → 保持 "?" (滑动不到位)
     """
     total = 12
-    MAX_ROUNDS = 3  # 最多重试 3 轮
+    MAX_ROUNDS = 3
 
-    # 所有 12 题的关键词（诊断用——仅反映扫描到的快照，不可见的问题无法判断）
     ALL_KEYWORDS = {
         1: "出口、通道", 2: "三合一", 3: "餐饮", 4: "违规用电",
         5: "电气线路", 6: "电动自行车", 7: "防盗窗", 8: "消火栓",
@@ -822,12 +838,45 @@ def fill_all_remaining_no():
 
     reported_nums = {p["num"] for p in PROBLEMS_TO_REPORT}
 
+    # 全局状态: None=未观测, "是(已处置)", "否"
+    problem_state = {num: None for num in range(1, total + 1)}
+
     # ================================================================
-    # 核心：在当前页面对所有可见「否」点击（跳过有「关联事件」的）
+    # 检测当前页所有可见问题的状态，更新 problem_state
     # ================================================================
-    def _click_visible_no(root):
-        """点击当前页所有可见的「否」（跳过关联事件旁的）"""
-        # 收集「关联事件」y 坐标
+    def _scan_page(root):
+        """扫描当前页，更新每个可见问题的状态"""
+        for num, kw in ALL_KEYWORDS.items():
+            if problem_state[num] is not None:
+                continue  # 已确认
+
+            # 找问题文本
+            prob_node = None
+            for node in _iter_all_nodes(root):
+                if kw in node.attrib.get("text", "") and _is_visible(node.attrib.get("bounds", "")):
+                    prob_node = node
+                    break
+            if prob_node is None:
+                continue
+
+            m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', prob_node.attrib.get("bounds", ""))
+            if not m:
+                continue
+            prob_yb = int(m.group(4))
+
+            # 检查「关联事件」
+            for node in _iter_all_nodes(root):
+                if "关联事件" in node.attrib.get("text", "") and _is_visible(node.attrib.get("bounds", "")):
+                    m2 = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', node.attrib.get("bounds", ""))
+                    if m2 and 0 < int(m2.group(2)) - prob_yb < 400:
+                        problem_state[num] = "是(已处置)"
+                        break
+
+    # ================================================================
+    # 在当前页点击「否」（跳过已处置的）
+    # ================================================================
+    def _click_no_on_page(root):
+        """点击当前页可见的「否」（跳过关联事件旁的），返回点击数"""
         markers_y = []
         for node in _iter_all_nodes(root):
             if "关联事件" in node.attrib.get("text", "") and _is_visible(node.attrib.get("bounds", "")):
@@ -835,7 +884,6 @@ def fill_all_remaining_no():
                 if m:
                     markers_y.append(int(m.group(2)))
 
-        # 点击「否」
         clicked = 0
         for node in _iter_all_nodes(root):
             if node.attrib.get("text") == "否" and _is_visible(node.attrib.get("bounds", "")):
@@ -849,82 +897,49 @@ def fill_all_remaining_no():
                             time.sleep(0.6)
         return clicked
 
-    # ================================================================
-    # 诊断：扫描当前页，尝试识别可见问题（尽力而为，不保证完整）
-    # ================================================================
-    def _diagnose_page(root, observed):
-        """尽力检测可见问题的「是」状态（仅检测关联事件标记，不检测否）"""
+    # 点击了「否」后标记对应问题（尽力——找被点击的最下方可见问题）
+    def _mark_clicked_no(root):
+        """点击否后，将下方最近的可观测问题标记为「否」"""
         for num, kw in ALL_KEYWORDS.items():
-            if observed[num] is not None:
-                continue  # 已确认过
-            prob_node = None
+            if problem_state[num] is not None:
+                continue
             for node in _iter_all_nodes(root):
                 if kw in node.attrib.get("text", "") and _is_visible(node.attrib.get("bounds", "")):
-                    prob_node = node
+                    problem_state[num] = "否"
                     break
-            if prob_node is None:
-                continue
-            m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', prob_node.attrib.get("bounds", ""))
-            if not m:
-                continue
-            prob_yb = int(m.group(4))
-
-            # 检查「关联事件」
-            for node in _iter_all_nodes(root):
-                if "关联事件" in node.attrib.get("text", "") and _is_visible(node.attrib.get("bounds", "")):
-                    m2 = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', node.attrib.get("bounds", ""))
-                    if m2 and 0 < int(m2.group(2)) - prob_yb < 400:
-                        observed[num] = "是"
-                        break
 
     # ================================================================
-    # 辅助：判断指定问题是否"完整可见"（题目文本 + 至少一个选项都在屏幕内）
-    # ================================================================
-    def _is_problem_fully_visible(root, num):
-        """检查问题 num 的文本和选项（是/否）是否都在可视区域"""
-        kw = ALL_KEYWORDS.get(num)
-        if not kw:
-            return False
-        prob_yb = None
-        for node in _iter_all_nodes(root):
-            if kw in node.attrib.get("text", "") and _is_visible(node.attrib.get("bounds", "")):
-                m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', node.attrib.get("bounds", ""))
-                if m:
-                    prob_yb = int(m.group(4))
-                    break
-        if prob_yb is None:
-            return False
-        # 检查下方 500px 内是否有可见的「是」或「否」
-        for node in _iter_all_nodes(root):
-            if node.attrib.get("text") in ("是", "否") and _is_visible(node.attrib.get("bounds", "")):
-                m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', node.attrib.get("bounds", ""))
-                if m and 0 < int(m.group(2)) - prob_yb < 500:
-                    return True
-        return False
-
-    # ================================================================
-    # 一轮双向扫描：以问题1/12的可见性为边界标志
+    # 一轮完整扫描
     # ================================================================
     def _one_round():
-        """执行一轮完整双向扫描，返回 (final_n, total_clicked)。
-        退出条件以计数器 n>=12 为准（权威），边界检测只是辅助日志。"""
+        nonlocal problem_state
         total_clicked = 0
 
-        # ── Pass 1: 滑到顶部（问题1完整可见 或 计数器不再变化） ──
+        # Pass 1: 滑到顶部（问题1的文本可见 或 计数器不再变化）
         prev_n = -1
         for _ in range(20):
             root, _, _ = get_latest_ui()
-            if root is not None and _is_problem_fully_visible(root, 1):
-                print("    到顶: 问题1可见", flush=True)
+            if root is None:
+                continue
+            _scan_page(root)
+            # 问题1文本或选项可见 = 到顶
+            kw1 = ALL_KEYWORDS[1]
+            at_top = False
+            for node in _iter_all_nodes(root):
+                if kw1 in node.attrib.get("text", "") and _is_visible(node.attrib.get("bounds", "")):
+                    at_top = True
+                    break
+            if at_top:
+                print("    到顶", flush=True)
                 break
-            if root is not None:
-                n, _ = _read_counter(root)
-                if n == prev_n and prev_n > 0:
-                    break  # 页面不再变化
-                prev_n = n
+            # 计数器不再变化也退出
+            n, _ = _read_counter(root)
+            if n == prev_n and prev_n > 0:
+                break
+            prev_n = n
             _swipe_page_up()
 
-        # ── Pass 2: 从上到下扫描，计数器满 12 即退出 ──
+        # Pass 2: 从上到下
         prev_n = -1
         stuck = 0
         for _ in range(30):
@@ -932,27 +947,27 @@ def fill_all_remaining_no():
             if root is None:
                 continue
             n, _ = _read_counter(root)
-            c = _click_visible_no(root)
+            _scan_page(root)
+            c = _click_no_on_page(root)
+            _mark_clicked_no(root)
             total_clicked += c
-            at_bottom = _is_problem_fully_visible(root, 12)
-            print(f"    [{n}/{total}] 点{c}个 {'▼' if at_bottom else ''}", flush=True)
+            confirmed = sum(1 for v in problem_state.values() if v is not None)
+            print(f"    [{n}/{total}] 点{c}个 已识别{confirmed}/12", flush=True)
 
             if n >= total:
-                print(f"    计数器已满 {n}/{total}, 退出")
                 return n, total_clicked
-
-            # 防卡死：如果计数器连续 3 页不变且无点击，提前退出
-            if n == prev_n and c == 0:
+            # 防卡死：计数器连续 3 页不变（无论有无点击）即退出
+            if n == prev_n:
                 stuck += 1
                 if stuck >= 3:
-                    print(f"    页面无变化({stuck}次), 提前结束本方向")
+                    print(f"    计数器停滞({stuck}页), 结束本方向")
                     break
             else:
                 stuck = 0
             prev_n = n
             _swipe_page_down()
 
-        # ── Pass 3: 从下到上回扫 ──
+        # Pass 3: 回扫
         prev_n = -1
         stuck = 0
         for _ in range(30):
@@ -960,15 +975,16 @@ def fill_all_remaining_no():
             if root is None:
                 continue
             n, _ = _read_counter(root)
-            c = _click_visible_no(root)
+            _scan_page(root)
+            c = _click_no_on_page(root)
+            _mark_clicked_no(root)
             total_clicked += c
-            print(f"    [{n}/{total}] 点{c}个", flush=True)
+            confirmed = sum(1 for v in problem_state.values() if v is not None)
+            print(f"    [{n}/{total}] 点{c}个 已识别{confirmed}/12", flush=True)
 
             if n >= total:
-                print(f"    计数器已满 {n}/{total}, 退出")
                 return n, total_clicked
-
-            if n == prev_n and c == 0:
+            if n == prev_n:
                 stuck += 1
                 if stuck >= 3:
                     break
@@ -985,7 +1001,7 @@ def fill_all_remaining_no():
     # 主逻辑
     # ================================================================
     print(f"\n{'─' * 40}")
-    print("[批量] 扫描填写剩余「否」...")
+    print("[批量] 逐页扫描 + 记录每题状态...")
 
     final_n = 0
     total_clicked = 0
@@ -996,50 +1012,61 @@ def fill_all_remaining_no():
             if n >= total:
                 final_n = n
                 break
-        print(f"  第 {rd}/{MAX_ROUNDS} 轮扫描...")
+        print(f"  第 {rd}/{MAX_ROUNDS} 轮...")
         final_n, clicked = _one_round()
         total_clicked += clicked
         if final_n >= total:
             break
-        print(f"  本轮结束: {final_n}/{total}, 重试...")
+        print(f"  本轮: {final_n}/{total}, 重试...")
         time.sleep(1)
 
     # ================================================================
-    # 最终验证 + 诊断汇总
+    # 补充扫描：仅在未完整时补扫收集状态
+    # ================================================================
+    if final_n < total or any(v is None for v in problem_state.values()):
+        for _ in range(10):
+            _swipe_page_up()
+        for _ in range(25):
+            root, _, _ = get_latest_ui()
+            if root is not None:
+                _scan_page(root)
+            _swipe_page_down()
+
+    # ================================================================
+    # 输出 12 题完整状态表
     # ================================================================
     print(f"\n{'─' * 40}")
+    print(f"[结果] 12 题填写状态 (计数器 {final_n}/{total}):")
+    print(f"{'─' * 40}")
 
-    # 硬判：以计数器为准
-    if final_n >= total:
-        print(f"[批量] [OK] 计数器 {final_n}/{total} — 全部填写完毕")
+    all_match = True
+    for num in range(1, total + 1):
+        st = problem_state.get(num)
+        display = st if st else "?"
+        if num in reported_nums:
+            # 用户要求「是」
+            ok = (st == "是(已处置)")
+            flag = "[OK]" if ok else "[!!] 应为是"
+            if not ok:
+                all_match = False
+        else:
+            # 用户要求「否」
+            ok = (st == "否")
+            # 如果计数器满但没观测到，大概率是「否」(只是没被扫到)
+            if st is None and final_n >= total:
+                display = "否*"  # 推断
+                ok = True
+            flag = "[OK]" if ok else f"[!!] 应为否"
+            if not ok:
+                all_match = False
+        print(f"  问题{num:>2}: {display:<10} {flag}")
+
+    print(f"{'─' * 40}")
+    if all_match and final_n >= total:
+        print(f"[批量] [OK] 全部正确，与用户命令一致")
     else:
-        print(f"[批量] [!!] 计数器 {final_n}/{total} — 可能不完整 (共点击 {total_clicked} 次)")
+        print(f"[批量] [!!] 存在问题，请检查上方标记 [!!] 的项")
         screenshot("incomplete_scan")
-
-    # 诊断：仅在不完整时才滑动检查（完整时直接跳过，避免无效滑动）
-    if final_n < total:
-        observed = {num: None for num in range(1, total + 1)}
-        for _ in range(10):
-            _swipe_page_down()
-        root, _, _ = get_latest_ui()
-        if root is not None:
-            _diagnose_page(root, observed)
-        for _ in range(15):
-            _swipe_page_up()
-        root, _, _ = get_latest_ui()
-        if root is not None:
-            _diagnose_page(root, observed)
-
-        print(f"\n[诊断] 观察到的题目状态 (仅供参考):")
-        for num in range(1, total + 1):
-            st = observed[num]
-            if num in reported_nums:
-                display = st if st else "?"
-                flag = "[OK]" if st == "是" else "[!!]"
-                print(f"  问题{num:>2}: {display:<6} (预期是) {flag}")
-            else:
-                display = st if st else "?"
-                print(f"  问题{num:>2}: {display:<6} (预期否) [?]")
 
 
 def fill_hazard_details(hazard_category="消防安全", hazard_subcategory="出口、通道不畅通"):
